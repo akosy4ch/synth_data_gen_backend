@@ -1,0 +1,25 @@
+
+# Node.js
+node_modules/
+build/
+dist/
+
+# Python
+__pycache__/
+*.pyc
+uploads/
+logs/
+
+# OS
+.DS_Store
+
+# IDEs
+.vscode/
+.idea/
+
+# Env
+.env
+
+venv/
+uploads/
+__pycache__/
