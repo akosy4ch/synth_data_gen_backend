@@ -1,0 +1,26 @@
+# Backend и API
+fastapi
+uvicorn[standard]
+python-multipart
+aiofiles
+pandas
+numpy
+python-jose[cryptography]
+passlib[bcrypt]
+python-multipart
+scikit-learn
+
+# SDV для числовых данных
+sdv
+
+# Markov цепи для текста
+markovify
+
+# Hugging Face + PyTorch для генерации текста
+transformers
+torch
+
+# Для BERT-перефразирования (Parrot)
+nltk
+sentencepiece
+git+https://github.com/PrithivirajDamodaran/Parrot_Paraphraser.git
