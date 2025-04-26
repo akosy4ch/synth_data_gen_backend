@@ -19,6 +19,6 @@ This project is the backend API for generating synthetic datasets based on user-
 ## Installation
 
 ```bash
-git clone [https://github.com/akosy4ch/synth_data_gen_backend.git]
+git clone https://github.com/akosy4ch/synth_data_gen_backend.git
 cd synthetic_data_generator/backend
 bash setup.sh
