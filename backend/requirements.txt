@@ -9,7 +9,13 @@ python-jose[cryptography]
 passlib[bcrypt]
 python-multipart
 scikit-learn
+pydantic[email]
 
+sqlalchemy
+alembic          # for migrations, optional
+aiobotocore      # async S3 client
+psycopg2-binary  # Postgres driver
+minio   
 # SDV для числовых данных
 sdv
 

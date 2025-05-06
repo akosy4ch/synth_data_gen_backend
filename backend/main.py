@@ -12,12 +12,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from typing import List
 
-from backend.src.generator import generate_synthetic
-from backend.src.data_processing import load_dataset
-from backend.src.text_analysis import analyze_text_statistics, compare_datasets
-from backend.src.auth.routes import router as auth_router
+from src.generator import generate_synthetic
+from src.data_processing import load_dataset
+from src.text_analysis import analyze_text_statistics, compare_datasets
+from src.auth.routes import router as auth_router
 
 app = FastAPI()
+
+@app.on_event("startup")
+async def on_startup():
+    await init_db()
 
 app.include_router(auth_router)
 

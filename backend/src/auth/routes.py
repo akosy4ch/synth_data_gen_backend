@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException
-from backend.src.auth.models import UserRegister, UserLogin
-from backend.src.auth.security import hash_password, verify_password, create_access_token
+from src.auth.models import UserRegister, UserLogin
+from src.auth.security import hash_password, verify_password, create_access_token
 
 fake_users_db = {}
 
