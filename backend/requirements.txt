@@ -11,11 +11,12 @@ python-multipart
 scikit-learn
 pydantic[email]
 
+asyncpg>=0.26.0  # async Postgres driver
 sqlalchemy
 alembic          # for migrations, optional
 aiobotocore      # async S3 client
 psycopg2-binary  # Postgres driver
-minio   
+minio>=7.1.0  # S3 client for MinIO
 # SDV для числовых данных
 sdv
 

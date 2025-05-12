@@ -1,55 +1,29 @@
-from pathlib import Path
 import os
+import io
+import uuid
 import html
-import pandas as pd
-import logging
 import math
-import aiofiles
+import logging
 import asyncio
+from pathlib import Path
+from typing import List
 
+import pandas as pd
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from typing import List
+
+from minio import Minio
+from minio.error import S3Error
 
 from src.generator import generate_synthetic
 from src.data_processing import load_dataset
 from src.text_analysis import analyze_text_statistics, compare_datasets
 from src.auth.routes import router as auth_router
+from src.db import init_db  # Assuming this is your database initialization function
 
-app = FastAPI()
-
-@app.on_event("startup")
-async def on_startup():
-    await init_db()
-
-app.include_router(auth_router)
-
-import nltk
-nltk.download("punkt", quiet=True)
-
-app.mount
-
-# ➡️ Функция очистки NaN, inf
-def clean_floats(obj):
-    if isinstance(obj, float):
-        if math.isnan(obj) or math.isinf(obj):
-            return 0.0
-        return obj
-    elif isinstance(obj, dict):
-        return {k: clean_floats(v) for v in obj.items()}
-    elif isinstance(obj, list):
-        return [clean_floats(v) for v in obj]
-    else:
-        return obj
-
-# ➡️ Асинхронное сохранение загруженного файла
-async def save_upload_file(upload_file: UploadFile, destination: str):
-    async with aiofiles.open(destination, 'wb') as out_file:
-        while content := await upload_file.read(1024):
-            await out_file.write(content)
-
-# ➡️ Логирование
+# ----------------------------------------------------------
+# Setup logging
 log_dir = Path("logs")
 log_dir.mkdir(exist_ok=True)
 logging.basicConfig(
@@ -59,66 +33,110 @@ logging.basicConfig(
     level=logging.INFO
 )
 
-# ➡️ Инициализация FastAPI приложения
+# ----------------------------------------------------------
+app = FastAPI()
 
+# ----------------------------------------------------------
+def get_minio_client() -> Minio:
+    return Minio(
+        endpoint=os.getenv("S3_ENDPOINT"),
+        access_key=os.getenv("S3_ACCESS_KEY"),  # Ensure these match MinIO root credentials
+        secret_key=os.getenv("S3_SECRET_KEY"),  # Ensure these match MinIO root credentials
+        secure=False
+    )
 
+# ----------------------------------------------------------
+@app.on_event("startup")
+async def on_startup():
+    await init_db()
+    logging.info("Database tables ensured")
+async def init_minio_bucket():
+    client = get_minio_client()
+    bucket = os.getenv("S3_BUCKET")
+    try:
+        if not client.bucket_exists(bucket):
+            client.make_bucket(bucket)
+            logging.info(f"Created MinIO bucket: {bucket}")
+        else:
+            logging.info(f"Bucket already exists: {bucket}")
+    except S3Error as err:
+        if err.code == "BucketAlreadyOwnedByYou" or err.code == "BucketAlreadyExists":
+            logging.info(f"Bucket {bucket} already present")
+        else:
+            logging.error(f"Error initializing bucket {bucket}: {err}")
+            raise
+
+# ----------------------------------------------------------
+# Include authentication routes
+app.include_router(auth_router)
+
+# ----------------------------------------------------------
+# Setup CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # update in production to your frontend domain
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-UPLOAD_DIR = "uploads"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-
-#BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-#FRONTEND_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "frontend"))
-#if not os.path.exists(FRONTEND_DIR):
-#    raise RuntimeError(f"Frontend folder not found at {FRONTEND_DIR}")
-
+# ----------------------------------------------------------
+# Mount frontend if needed (uncomment when frontend exists)
+# BASE_DIR = Path(__file__).resolve().parent
+# FRONTEND_DIR = BASE_DIR.parent / "frontend"
+# app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
 
 # ----------------------------------------------------------
-# Анализ колонок
+# Analysis: Column Analysis Endpoint
+def read_upload(file: UploadFile) -> bytes:
+    """
+    Read entire upload into memory and return bytes.
+    """
+    return asyncio.get_event_loop().run_until_complete(file.read())
+
 @app.post("/analyze-columns/")
 async def analyze_columns(file: UploadFile = File(...)):
-    filepath = os.path.join(UPLOAD_DIR, file.filename)
+    contents = await file.read()
+    object_name = f"uploads/{uuid.uuid4()}.csv"
+    client = get_minio_client()
+    bucket = os.getenv("S3_BUCKET")
+
     try:
-        await save_upload_file(file, filepath)
+        client.put_object(
+            bucket_name=bucket,
+            object_name=object_name,
+            data=io.BytesIO(contents),
+            length=len(contents),
+            content_type=file.content_type
+        )
+        logging.info(f"Uploaded {file.filename} to {bucket}/{object_name}")
+    except S3Error as err:
+        logging.error(f"MinIO upload error: {err}")
+        raise HTTPException(status_code=502, detail="Storage error")
 
-        df = pd.read_csv(filepath, encoding_errors="ignore", on_bad_lines="skip")
+    try:
+        df = pd.read_csv(io.BytesIO(contents), encoding_errors="ignore", on_bad_lines="skip")
         column_info = []
-
         for col in df.columns:
             dtype = str(df[col].dtype)
             unique_count = df[col].nunique()
             sample_values = df[col].dropna().astype(str).unique().tolist()[:5]
-            avg_len = (
-                df[col].dropna().astype(str).apply(len).mean()
-                if dtype == "object" else None
-            )
+            avg_len = df[col].dropna().astype(str).apply(len).mean() if dtype == 'object' else None
             column_info.append({
-                "name": html.escape(col.replace("'", "&#39;")),
+                "name": html.escape(col),
                 "dtype": dtype,
                 "unique_values": unique_count,
                 "sample": sample_values,
                 "avg_length": avg_len
             })
-
-        logging.info(f"✅ Columns analyzed from file: {file.filename}")
+        logging.info(f"Analyzed columns for file: {file.filename}")
         return {"columns": column_info, "rows": len(df)}
-
     except Exception as e:
-        logging.error(f"❌ Error analyzing columns from {file.filename}: {e}", exc_info=True)
+        logging.error(f"Error analyzing columns: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        if os.path.exists(filepath):
-            os.remove(filepath)
 
 # ----------------------------------------------------------
-# Генерация синтетических данных
+# Synthetic Data Generation Endpoint
 @app.post("/generate-synthetic/")
 async def create_synthetic_data(
     file: UploadFile = File(...),
@@ -126,117 +144,123 @@ async def create_synthetic_data(
     models: List[str] = Form(...),
     samples: int = Form(...),
 ):
-    filepath = os.path.join(UPLOAD_DIR, file.filename)
+    contents = await file.read()
+    object_name = f"uploads/{uuid.uuid4()}.csv"
+    client = get_minio_client()
+    bucket = os.getenv("S3_BUCKET")
     try:
-        await save_upload_file(file, filepath)
+        client.put_object(
+            bucket_name=bucket,
+            object_name=object_name,
+            data=io.BytesIO(contents),
+            length=len(contents),
+            content_type=file.content_type
+        )
+        logging.info(f"Uploaded {file.filename} to {bucket}/{object_name}")
+    except S3Error as err:
+        logging.error(f"MinIO upload error: {err}")
+        raise HTTPException(status_code=502, detail="Storage error")
 
-        df_original, _ = load_dataset(filepath)
+    try:
+        # load dataset via existing helper (accepts path or buffer)
+        df_original, _ = load_dataset(io.BytesIO(contents))
 
-        columns = [html.unescape(col.strip()) for col in columns]
-        df_cols_set = set(df_original.columns)
-        missing_cols = [col for col in columns if col not in df_cols_set]
-        if missing_cols:
-            logging.error(f"❌ Columns not found: {missing_cols}")
-            raise HTTPException(status_code=400, detail=f"❌ Columns not found: {missing_cols}")
+        # validate columns
+        columns = [html.unescape(c.strip()) for c in columns]
+        missing = [c for c in columns if c not in df_original.columns]
+        if missing:
+            msg = f"Columns not found: {missing}"
+            logging.error(msg)
+            raise HTTPException(status_code=400, detail=msg)
 
-        results = {}
+        # prepare generation
         df_result = pd.DataFrame()
-
-        min_input_length = min(len(df_original[col].dropna()) for col in columns)
-        gen_size = min(samples, min_input_length)
-
+        analysis_results = {}
+        min_len = min(len(df_original[c].dropna()) for c in columns)
+        gen_size = min(samples, min_len)
         queue = asyncio.Queue()
-
-        # ➡️ Заполняем очередь заданиями на генерацию
         for col, model_type in zip(columns, models):
-            df_column = df_original[[col]]
-            task = "text" if df_column[col].dtype == object else "numeric"
-            await queue.put((df_column, model_type, gen_size, task, col))
+            task = 'text' if df_original[col].dtype == object else 'numeric'
+            await queue.put((df_original[[col]], model_type, gen_size, task, col))
 
-        # ➡️ Воркер для обработки одной задачи
         async def worker():
             while not queue.empty():
-                df_column, model_type, gen_size, task, col = await queue.get()
-                synthetic_df = await generate_synthetic(df_column, model_type, gen_size, task, col)
+                df_col, mtype, gsize, task, col = await queue.get()
+                synth_df = await generate_synthetic(df_col, mtype, gsize, task, col)
+                synth_df[col] = synth_df[col].fillna('').astype(str)
+                synth_df = synth_df[synth_df[col].str.strip() != '']
+                while len(synth_df) < gsize:
+                    synth_df = pd.concat([synth_df, synth_df]).head(gsize)
+                df_result[col] = synth_df[col].reset_index(drop=True)
 
-                synthetic_df[col] = synthetic_df[col].fillna("").astype(str)
-                synthetic_df = synthetic_df[synthetic_df[col].str.strip() != ""]
-
-                while len(synthetic_df) < gen_size:
-                    synthetic_df = pd.concat([synthetic_df, synthetic_df]).head(gen_size)
-
-                df_result[col] = synthetic_df[col].reset_index(drop=True)
-
-                if task == "text":
-                    original_texts = df_column[col].dropna().astype(str).tolist()
-                    synthetic_texts = synthetic_df[col].dropna().astype(str).tolist()
-                    results[col] = clean_floats({
-                        "stats_original": analyze_text_statistics(original_texts),
-                        "stats_synthetic": analyze_text_statistics(synthetic_texts),
-                        "comparison": compare_datasets(original_texts, synthetic_texts)
-                    })
-
+                if task == 'text':
+                    orig_texts = df_col[col].dropna().astype(str).tolist()
+                    synth_texts = synth_df[col].dropna().astype(str).tolist()
+                    analysis_results[col] = {
+                        'stats_original': analyze_text_statistics(orig_texts),
+                        'stats_synthetic': analyze_text_statistics(synth_texts),
+                        'comparison': compare_datasets(orig_texts, synth_texts)
+                    }
                 queue.task_done()
 
-        # ➡️ Запускаем несколько параллельных воркеров
         await asyncio.gather(*[worker() for _ in range(3)])
-
-        logging.info(f"✅ Synthetic generation completed for file: {file.filename}")
-        return clean_floats({
-            "synthetic": df_result.to_dict(orient="records"),
-            "analysis": results
-        })
-
+        logging.info(f"Synthetic generation completed for: {file.filename}")
+        return {
+            'synthetic': df_result.to_dict(orient='records'),
+            'analysis': analysis_results
+        }
     except Exception as e:
-        logging.error(f"❌ Error generating synthetic data from {file.filename}: {e}", exc_info=True)
+        logging.error(f"Error generating synthetic data: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        if os.path.exists(filepath):
-            os.remove(filepath)
 
 # ----------------------------------------------------------
-# Автоопределение конфигурации
+# Auto-Configuration Detection Endpoint
 @app.post("/detect-best-config/")
 async def detect_best_config(file: UploadFile = File(...)):
-    filepath = os.path.join(UPLOAD_DIR, file.filename)
+    contents = await file.read()
+    object_name = f"uploads/{uuid.uuid4()}.csv"
+    client = get_minio_client()
+    bucket = os.getenv("S3_BUCKET")
+
     try:
-        await save_upload_file(file, filepath)
+        client.put_object(
+            bucket_name=bucket,
+            object_name=object_name,
+            data=io.BytesIO(contents),
+            length=len(contents),
+            content_type=file.content_type
+        )
+        logging.info(f"Uploaded {file.filename} to {bucket}/{object_name}")
+    except S3Error as err:
+        logging.error(f"MinIO upload error: {err}")
+        raise HTTPException(status_code=502, detail="Storage error")
 
-        df = pd.read_csv(filepath, encoding="utf-8-sig", on_bad_lines="skip")
-        result = []
-
+    try:
+        df = pd.read_csv(io.BytesIO(contents), encoding_errors="ignore", on_bad_lines="skip")
+        recommendations = []
         for col in df.columns:
             series = df[col].dropna()
             if series.empty:
                 continue
-
             if series.dtype == object:
-                task = "text"
-                model = "GPT-J"
+                task, model = "text", "GPT-J"
             elif pd.api.types.is_numeric_dtype(series):
-                task = "numeric"
-                model = "CTGAN"
+                task, model = "numeric", "CTGAN"
             else:
-                task = "mixed"
-                model = "CTGAN"
+                task, model = "mixed", "CTGAN"
 
-            result.append({
-                "column": col,
-                "task": task,
-                "recommended_model": model,
-                "original_samples": int(len(series)),
-                "default_sample_size": int(len(series))
+            recommendations.append({
+                'column': col,
+                'task': task,
+                'recommended_model': model,
+                'original_samples': int(len(series)),
+                'default_sample_size': int(len(series)),
+                's3_path': f"{bucket}/{object_name}"
             })
-
-        logging.info(f"📊 Auto-detected config for file: {file.filename}")
-        return {"recommendations": result}
-
+        logging.info(f"Auto-detected config for: {file.filename}")
+        return {'recommendations': recommendations}
     except Exception as e:
-        logging.error(f"❌ Error in auto config detection: {e}", exc_info=True)
+        logging.error(f"Error in auto config detection: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        if os.path.exists(filepath):
-            os.remove(filepath)
 
-# ➡️ Монтируем фронтенд
-#app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
+# End of file
