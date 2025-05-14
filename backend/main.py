@@ -16,12 +16,11 @@ from fastapi.staticfiles import StaticFiles
 from minio import Minio
 from minio.error import S3Error
 
-from src.generator import generate_synthetic
-from src.data_processing import load_dataset
-from src.text_analysis import analyze_text_statistics, compare_datasets
+from src.generator.generator import generate_synthetic
+from src.data_processing.data_processing import load_dataset
+from src.text_analysis.text_analysis import analyze_text_statistics, compare_datasets
 from src.auth.routes import router as auth_router
-from src.db import init_db  # Assuming this is your database initialization function
-
+from src.database.db import init_db
 # ----------------------------------------------------------
 # Setup logging
 log_dir = Path("logs")
@@ -50,7 +49,9 @@ def get_minio_client() -> Minio:
 async def on_startup():
     await init_db()
     logging.info("Database tables ensured")
-async def init_minio_bucket():
+    await asyncio.to_thread(init_minio_bucket)
+    logging.info("MinIO bucket ensured")
+def init_minio_bucket():
     client = get_minio_client()
     bucket = os.getenv("S3_BUCKET")
     try:

@@ -1,6 +1,6 @@
-
-
 from pydantic import BaseModel, EmailStr
+from sqlalchemy import Column, Integer, String
+from src.database.db import Base
 
 class UserRegister(BaseModel):
     username: str
@@ -10,10 +10,6 @@ class UserRegister(BaseModel):
 class UserLogin(BaseModel):
     username: str
     password: str
-    
-# filepath: c:\Users\user\Desktop\synth_data_gen_backend\backend\src\auth\database_models.py
-from sqlalchemy import Column, Integer, String
-from ..db import Base
 
 class User(Base):
     __tablename__ = "users"

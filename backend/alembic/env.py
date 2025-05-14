@@ -9,7 +9,7 @@ from alembic import context
 sys.path.append(os.path.abspath(os.path.dirname(__file__) + "/.."))
 
 # Import your Base metadata
-from src.db import Base  # noqa: E402
+from backend.src.database.db import Base  # noqa: E402
 
 # this is the Alembic Config object, which provides\# access to the values within the .ini file in use.
 config = context.config

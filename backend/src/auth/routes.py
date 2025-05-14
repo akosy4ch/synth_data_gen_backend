@@ -3,11 +3,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from passlib.context import CryptContext
 
-
 from src.auth.security import hash_password, verify_password, create_access_token
-from src.db import get_db  # updated import
-from src.auth.database_models import User
-from src.auth.database_models import UserRegister, UserLogin  # your ORM User model
+from src.database.db import get_db
+from src.auth.database_models import User, UserRegister, UserLogin
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
