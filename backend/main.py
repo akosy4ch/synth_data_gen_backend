@@ -11,6 +11,7 @@ from typing import List
 import pandas as pd
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi import Query
 from fastapi.staticfiles import StaticFiles
 
 from minio import Minio
@@ -22,7 +23,7 @@ from src.text_analysis.text_analysis import analyze_text_statistics, compare_dat
 from src.auth.routes import router as auth_router
 from src.database.db import init_db
 # ----------------------------------------------------------
-# Setup logging
+# logging
 log_dir = Path("logs")
 log_dir.mkdir(exist_ok=True)
 logging.basicConfig(
@@ -68,11 +69,10 @@ def init_minio_bucket():
             raise
 
 # ----------------------------------------------------------
-# Include authentication routes
 app.include_router(auth_router)
 
 # ----------------------------------------------------------
-# Setup CORS
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # update in production to your frontend domain
@@ -81,11 +81,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ----------------------------------------------------------
-# Mount frontend if needed (uncomment when frontend exists)
-# BASE_DIR = Path(__file__).resolve().parent
-# FRONTEND_DIR = BASE_DIR.parent / "frontend"
-# app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
+
 
 # ----------------------------------------------------------
 # Analysis: Column Analysis Endpoint
@@ -117,6 +113,8 @@ async def analyze_columns(file: UploadFile = File(...)):
 
     try:
         df = pd.read_csv(io.BytesIO(contents), encoding_errors="ignore", on_bad_lines="skip")
+        df.columns = df.columns.str.strip()  #удаление пробелов в названиях колонок
+
         column_info = []
         for col in df.columns:
             dtype = str(df[col].dtype)
@@ -124,7 +122,7 @@ async def analyze_columns(file: UploadFile = File(...)):
             sample_values = df[col].dropna().astype(str).unique().tolist()[:5]
             avg_len = df[col].dropna().astype(str).apply(len).mean() if dtype == 'object' else None
             column_info.append({
-                "name": html.escape(col),
+                "name": col,
                 "dtype": dtype,
                 "unique_values": unique_count,
                 "sample": sample_values,
@@ -136,6 +134,7 @@ async def analyze_columns(file: UploadFile = File(...)):
         logging.error(f"Error analyzing columns: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
+
 # ----------------------------------------------------------
 # Synthetic Data Generation Endpoint
 @app.post("/generate-synthetic/")
@@ -144,6 +143,7 @@ async def create_synthetic_data(
     columns: List[str] = Form(...),
     models: List[str] = Form(...),
     samples: int = Form(...),
+    preserve_other_columns: bool = Form(True),
 ):
     contents = await file.read()
     object_name = f"uploads/{uuid.uuid4()}.csv"
@@ -163,10 +163,10 @@ async def create_synthetic_data(
         raise HTTPException(status_code=502, detail="Storage error")
 
     try:
-        # load dataset via existing helper (accepts path or buffer)
+        # загрузка датасета
         df_original, _ = load_dataset(io.BytesIO(contents))
 
-        # validate columns
+        # проверка наличия колонок
         columns = [html.unescape(c.strip()) for c in columns]
         missing = [c for c in columns if c not in df_original.columns]
         if missing:
@@ -174,7 +174,7 @@ async def create_synthetic_data(
             logging.error(msg)
             raise HTTPException(status_code=400, detail=msg)
 
-        # prepare generation
+        # подготовка к синтетической генерации
         df_result = pd.DataFrame()
         analysis_results = {}
         min_len = min(len(df_original[c].dropna()) for c in columns)
@@ -205,17 +205,27 @@ async def create_synthetic_data(
                 queue.task_done()
 
         await asyncio.gather(*[worker() for _ in range(3)])
-        logging.info(f"Synthetic generation completed for: {file.filename}")
+        if preserve_other_columns:
+            for col in columns:
+                df_original[col] = df_result[col]
+            output_df = df_original
+        else:
+            output_df = df_result
+
+        logging.info(f"Synthetic generation completed | file: {file.filename} | output shape: {output_df.shape}")
         return {
-            'synthetic': df_result.to_dict(orient='records'),
+            'synthetic': output_df.to_dict(orient='records'),
             'analysis': analysis_results
         }
+
     except Exception as e:
-        logging.error(f"Error generating synthetic data: {e}", exc_info=True)
+        logging.error(f"Error generating synthetic data | file: {file.filename} | columns: {columns} | models: {models} | error: {e}", exc_info=True)
+        print(f"❌ Error in /generate-synthetic/: {e}")  # Add this line for console output
         raise HTTPException(status_code=500, detail=str(e))
 
+
 # ----------------------------------------------------------
-# Auto-Configuration Detection Endpoint
+
 @app.post("/detect-best-config/")
 async def detect_best_config(file: UploadFile = File(...)):
     contents = await file.read()
@@ -243,25 +253,48 @@ async def detect_best_config(file: UploadFile = File(...)):
             series = df[col].dropna()
             if series.empty:
                 continue
-            if series.dtype == object:
-                task, model = "text", "GPT-J"
-            elif pd.api.types.is_numeric_dtype(series):
-                task, model = "numeric", "CTGAN"
-            else:
-                task, model = "mixed", "CTGAN"
 
-            recommendations.append({
-                'column': col,
-                'task': task,
-                'recommended_model': model,
-                'original_samples': int(len(series)),
-                'default_sample_size': int(len(series)),
-                's3_path': f"{bucket}/{object_name}"
-            })
-        logging.info(f"Auto-detected config for: {file.filename}")
+            col_info = {
+                "column": col,
+                "dtype": str(series.dtype),
+                "unique_values": int(series.nunique()),
+                "sample_values": series.astype(str).unique().tolist()[:5],
+                "original_samples": int(len(series)),
+                "default_sample_size": int(len(series)),
+                "s3_path": f"{bucket}/{object_name}"
+            }
+
+            
+            if series.dtype == object:
+                avg_len = series.astype(str).apply(len).mean()
+                # выбор моделей для текстовых данных
+                if avg_len < 30 and col_info["unique_values"] < 100:
+                    suggested_models = ["MARKOV", "FLAN-T5", "GPT-J"]
+                elif avg_len < 100:
+                    suggested_models = ["FLAN-T5", "GPT-J", "LLAMA-2-7B"]
+                else:
+                    suggested_models = ["GPT-J", "LLAMA-2-7B", "DEEPSEEK"]
+                task = "text"
+            elif pd.api.types.is_numeric_dtype(series):
+                # выбор моделей для числовых данных
+                suggested_models = ["CTGAN", "TVAE", "GMM"]
+                task = "numeric"
+            else:
+                suggested_models = ["CTGAN", "TVAE"]
+                task = "mixed"
+
+            col_info["task"] = task
+            col_info["suggested_models"] = suggested_models
+            # опциональная модель по умолчанию
+            col_info["recommended_model"] = suggested_models[0]
+
+            recommendations.append(col_info)
+
+        logging.info(f"Advanced auto-detected config for: {file.filename}")
         return {'recommendations': recommendations}
     except Exception as e:
         logging.error(f"Error in auto config detection: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
 
 # End of file
