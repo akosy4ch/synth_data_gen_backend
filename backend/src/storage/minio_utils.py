@@ -15,9 +15,8 @@ async def upload_fileobj(file_obj, key: str):
         aws_secret_access_key=S3_SECRET_KEY,
         aws_access_key_id=S3_ACCESS_KEY,
     ) as client:
-        # ensure bucket exists (once, or do it in startup)
-        await client.create_bucket(Bucket=S3_BUCKET)
         await client.put_object(Bucket=S3_BUCKET, Key=key, Body=file_obj)
+    return key
 
 async def download_fileobj(key: str):
     async with session.create_client(
