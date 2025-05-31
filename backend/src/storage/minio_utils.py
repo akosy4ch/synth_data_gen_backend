@@ -1,5 +1,6 @@
 import os
 import aiobotocore.session
+from minio import Minio
 
 S3_ENDPOINT   = os.getenv("S3_ENDPOINT")
 S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY")
@@ -27,3 +28,12 @@ async def download_fileobj(key: str):
     ) as client:
         resp = await client.get_object(Bucket=S3_BUCKET, Key=key)
         return await resp["Body"].read()
+
+
+def get_minio_client():
+    return Minio(
+        endpoint=S3_ENDPOINT,
+        access_key=S3_ACCESS_KEY,
+        secret_key=S3_SECRET_KEY,
+        secure=False
+    )

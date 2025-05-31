@@ -3,6 +3,7 @@ import asyncio
 import logging
 from sdv.single_table import CTGANSynthesizer, TVAESynthesizer, GaussianCopulaSynthesizer
 from sdv.metadata import SingleTableMetadata
+from src.generator.utils import validate_model_for_columns
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +19,7 @@ async def generate_numeric(df: pd.DataFrame, model_type: str, samples: int) -> p
 
 def _generate_numeric_sync(df: pd.DataFrame, model_type: str, samples: int) -> pd.DataFrame:
     logger.info(f"Generating synthetic numeric data using model: {model_type} | Rows: {len(df)}")
-
+    model_type = validate_model_for_columns("numeric", model_type, df)
     metadata = SingleTableMetadata()
     metadata.detect_from_dataframe(data=df)
 

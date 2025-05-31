@@ -31,4 +31,4 @@ torch
 # Для BERT-перефразирования (Parrot)
 nltk
 sentencepiece
-git+https://github.com/PrithivirajDamodaran/Parrot_Paraphraser.git
+

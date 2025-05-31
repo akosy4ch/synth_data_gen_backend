@@ -30,34 +30,16 @@ from src.auth.routes import router as auth_router
 from src.database.db import init_db
 
 from fastapi import Depends
+from pandas.api.types import is_string_dtype
 from sqlalchemy.future import select
 from src.database.models import Dataset, UploadedFile
 from src.database.models import UploadedFile
 from src.database.db import get_db
 from src.storage.minio_utils import upload_fileobj
 from src.database.utils import save_file_record_to_db
-# ----------------------------------------------------------
-# logging
-log_dir = Path("logs")
-log_dir.mkdir(exist_ok=True)
-logging.basicConfig(
-    filename=log_dir / "app.log",
-    filemode="a",
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
 
 # ----------------------------------------------------------
 app = FastAPI()
-
-# ----------------------------------------------------------
-def get_minio_client() -> Minio:
-    return Minio(
-        endpoint=os.getenv("S3_ENDPOINT"),
-        access_key=os.getenv("S3_ACCESS_KEY"),  # Ensure these match MinIO root credentials
-        secret_key=os.getenv("S3_SECRET_KEY"),  # Ensure these match MinIO root credentials
-        secure=False
-    )
 
 # ----------------------------------------------------------
 @app.on_event("startup")
@@ -83,7 +65,15 @@ def init_minio_bucket():
             raise
 
 # ----------------------------------------------------------
-app.include_router(auth_router)
+# logging
+log_dir = Path("logs")
+log_dir.mkdir(exist_ok=True)
+logging.basicConfig(
+    filename=log_dir / "app.log",
+    filemode="a",
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
 
 # ----------------------------------------------------------
 # CORS
@@ -111,7 +101,8 @@ def read_upload(file: UploadFile) -> bytes:
 async def analyze_columns(file: UploadFile = File(...),
 current_user: User = Depends(get_current_user)):
     contents = await file.read()
-    object_name = f"uploads/{uuid.uuid4()}.csv"
+    object_name = f"uploads/original/{uuid.uuid4()}.csv"
+
 
     try:
         key = await upload_fileobj(contents, object_name)
@@ -160,20 +151,36 @@ async def create_synthetic_data(
     models: List[str] = Form(...),
     samples: int = Form(...),
     preserve_other_columns: bool = Form(True),
-    current_user: User = Depends(get_current_user)  
+    current_user: User = Depends(get_current_user)
 ):
+    logging.info(f"starte !!!!")
+    print("stated")
+    import html
+    from pathlib import Path
+    import uuid
+    import io
+    import os
+
     contents = await file.read()
-    object_name = f"uploads/{uuid.uuid4()}.csv"
+
+    # 🔄 Step 1: Derive synthetic filename
+    orig_filename = Path(file.filename).stem
+    synthetic_filename = f"{orig_filename}_synthetic.csv"
+    object_name = f"uploads/synthetic/{uuid.uuid4()}_{synthetic_filename}"
+
 
     try:
+        # 🔼 Step 2: Upload to MinIO
         key = await upload_fileobj(contents, object_name)
+
+        # 🧾 Step 3: Save record in DB
         await save_file_record_to_db(
-            filename=file.filename,
+            filename=synthetic_filename,
             s3_path=key,
             file_type="synthetic",
             owner_id=current_user.id
         )
-        logging.info(f"Uploaded {file.filename} to {key}")
+        logging.info(f"Uploaded {synthetic_filename} to {key}")
     except Exception as err:
         logging.error(f"Storage or DB error: {err}", exc_info=True)
         raise HTTPException(status_code=502, detail="Storage error")
@@ -187,50 +194,95 @@ async def create_synthetic_data(
 
         df_result = pd.DataFrame()
         analysis_results = {}
+
         min_len = min(len(df_original[c].dropna()) for c in columns)
         gen_size = min(samples, min_len)
+
         queue = asyncio.Queue()
         for col, model_type in zip(columns, models):
-            task = 'text' if df_original[col].dtype == object else 'numeric'
-            await queue.put((df_original[[col]], model_type, gen_size, task, col))
+            logging.info(f"Processing column: {col} - dtype: {df_original[col].dtype} - model: {model_type}")
+            task = 'text' if is_string_dtype(df_original[col]) else 'numeric'
 
+            await queue.put((df_original[[col]], model_type, gen_size, task, col))
+        
         async def worker():
             while not queue.empty():
-                df_col, mtype, gsize, task, col = await queue.get()
-                synth_df = await generate_synthetic(df_col, mtype, gsize, task, col)
-                synth_df[col] = synth_df[col].fillna('').astype(str)
-                synth_df = synth_df[synth_df[col].str.strip() != '']
-                while len(synth_df) < gsize:
-                    synth_df = pd.concat([synth_df, synth_df]).head(gsize)
-                df_result[col] = synth_df[col].reset_index(drop=True)
+                try:
+                    df_col, mtype, gsize, task, col = await queue.get()
+                    print(f"📦 Column: {col}, Model: {mtype}, Sample Size: {gsize}")
+                    print(f"📝 First 3 prompts: {df_col[col].dropna().astype(str).tolist()[:3]}")
+                    gen_df = await generate_synthetic(df_col, mtype, gsize, task, col)
 
-                if task == 'text':
-                    orig_texts = df_col[col].dropna().astype(str).tolist()
-                    synth_texts = synth_df[col].dropna().astype(str).tolist()
-                    analysis_results[col] = {
-                        'stats_original': analyze_text_statistics(orig_texts),
-                        'stats_synthetic': analyze_text_statistics(synth_texts),
-                        'comparison': compare_datasets(orig_texts, synth_texts)
-                    }
-                queue.task_done()
+                    if gen_df.empty or gen_df.shape[1] == 0:
+                        logging.error(f"❌ Model did not generate any data for column '{col}'. DataFrame shape: {gen_df.shape}")
+                        continue  # 💡 Skip this column instead of crashing everything
+                    
+                    if col not in gen_df.columns:
+                        logging.warning(f"⚠️ Column '{col}' not found in generated output. Trying to rename. Columns: {list(gen_df.columns)}")
+                        if gen_df.shape[1] == 1:
+                            gen_df.columns = [col]
+                            logging.info(f"Renamed single column to '{col}'")
+                        else:
+                            logging.error(f"❌ Failed to map generated column to '{col}' due to ambiguous structure.")
+                            continue  # 💡 Gracefully skip instead of raising error
+
+                    # 💡 Safely access the column only after it's confirmed
+                    if col in gen_df.columns:
+                        gen_df[col] = gen_df[col].fillna('').astype(str)
+                        gen_df = gen_df[gen_df[col].str.strip() != '']
+                        while len(gen_df) < gsize:
+                            gen_df = pd.concat([gen_df, gen_df]).head(gsize)
+
+                        df_result[col] = gen_df[col].reset_index(drop=True)
+
+                        # 📊 Analyze text columns
+                        if task == 'text':
+                            orig_texts = df_col[col].dropna().astype(str).tolist()
+                            synth_texts = gen_df[col].dropna().astype(str).tolist()
+                            analysis_results[col] = {
+                                'stats_original': analyze_text_statistics(orig_texts),
+                                'stats_synthetic': analyze_text_statistics(synth_texts),
+                                'comparison': compare_datasets(orig_texts, synth_texts)
+                            }
+                except Exception as e:
+                    logging.exception(f"❌ Error in synthetic generation for column {col}")
+                finally:
+                    queue.task_done()
 
         await asyncio.gather(*[worker() for _ in range(3)])
+
+        if df_result.empty:
+            return {
+                "synthetic": [],
+                "analysis": {},
+                "warning": "No columns were generated. Please review model selections and column data."
+            }
+        
+        if df_result.empty:
+            logging.error("df_result is empty after generation.")
+
         if preserve_other_columns:
             for col in columns:
-                df_original[col] = df_result[col]
+                if col in df_result.columns:
+                    df_original[col] = df_result[col]
+                else:
+                    logging.warning(f"Column '{col}' was not generated and will not be replaced in the output.")
             output_df = df_original
         else:
             output_df = df_result
 
-        return {
-            'synthetic': output_df.to_dict(orient='records'),
+        failed_columns = [col for col in columns if col not in df_result.columns]
+        response = {
+            'synthetic': output_df.replace([float('inf'), float('-inf')], None).where(pd.notnull(output_df), None).to_dict(orient='records'),
             'analysis': analysis_results
         }
-
+        if failed_columns:
+            response['warning'] = f"Some columns were not generated: {failed_columns}"
+        return response
+        
     except Exception as e:
         logging.error(f"Error generating synthetic data: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.post("/detect-best-config/")
 async def detect_best_config(file: UploadFile = File(...)):
@@ -304,32 +356,59 @@ async def detect_best_config(file: UploadFile = File(...)):
 
 # ----------------------------------------------------------
 
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+import pandas as pd
+from minio.error import S3Error
+from src.text_analysis.text_analysis import analyze_text_statistics, compare_datasets
+from src.storage.minio_utils import get_minio_client
+import logging
+
+router = APIRouter()
 
 class TextEvaluationFromStorageRequest(BaseModel):
     original_s3_path: str
     synthetic_s3_path: str
 
-
-@app.post("/evaluate-texts/")
+@router.post("/evaluate-texts/")
 async def evaluate_texts_from_storage(payload: TextEvaluationFromStorageRequest):
     try:
         client = get_minio_client()
 
-        # parse bucket and object names
+        # Validate s3_path format
+        if "/" not in payload.original_s3_path or "/" not in payload.synthetic_s3_path:
+            raise HTTPException(status_code=400, detail="Invalid s3_path format. Expected 'bucket/object_name'.")
+
         orig_bucket, orig_path = payload.original_s3_path.split("/", 1)
         synth_bucket, synth_path = payload.synthetic_s3_path.split("/", 1)
 
-        # download files from MinIO
-        original_obj = client.get_object(orig_bucket, orig_path)
-        synthetic_obj = client.get_object(synth_bucket, synth_path)
+        # Try to retrieve original file
+        try:
+            original_obj = client.get_object(orig_bucket, orig_path)
+        except S3Error as e:
+            logging.error(f"MinIO error for original file: {e.code} - {e.message}")
+            raise HTTPException(status_code=502, detail=f"Could not access original file: {e.message}")
 
+        # Try to retrieve synthetic file
+        try:
+            synthetic_obj = client.get_object(synth_bucket, synth_path)
+        except S3Error as e:
+            logging.error(f"MinIO error for synthetic file: {e.code} - {e.message}")
+            raise HTTPException(status_code=502, detail=f"Could not access synthetic file: {e.message}")
+
+        # Load CSV files
         df_original = pd.read_csv(original_obj, encoding_errors="ignore", on_bad_lines="skip")
         df_synthetic = pd.read_csv(synthetic_obj, encoding_errors="ignore", on_bad_lines="skip")
 
-        # take the first column that contains text
-        text_col_orig = df_original.select_dtypes(include="object").columns[0]
-        text_col_synth = df_synthetic.select_dtypes(include="object").columns[0]
+        # Select first available text column
+        text_cols_orig = df_original.select_dtypes(include="object").columns
+        text_cols_synth = df_synthetic.select_dtypes(include="object").columns
+
+        if text_cols_orig.empty or text_cols_synth.empty:
+            raise HTTPException(status_code=400, detail="No text column found in one of the files")
+
+        text_col_orig = text_cols_orig[0]
+        text_col_synth = text_cols_synth[0]
 
         orig_texts = df_original[text_col_orig].dropna().astype(str).tolist()
         synth_texts = df_synthetic[text_col_synth].dropna().astype(str).tolist()
@@ -337,24 +416,42 @@ async def evaluate_texts_from_storage(payload: TextEvaluationFromStorageRequest)
         if not orig_texts or not synth_texts:
             raise HTTPException(status_code=400, detail="Text columns are empty")
 
+        # Limit comparison to minimum shared length
+        limit = min(len(orig_texts), len(synth_texts))
+        orig_texts = orig_texts[:limit]
+        synth_texts = synth_texts[:limit]
+
         stats_original = analyze_text_statistics(orig_texts)
         stats_synthetic = analyze_text_statistics(synth_texts)
         comparison = compare_datasets(orig_texts, synth_texts)
 
         return {
+            "original_column": text_col_orig,
+            "synthetic_column": text_col_synth,
             "original_stats": stats_original,
             "synthetic_stats": stats_synthetic,
-            "comparison": comparison
+            "comparison": comparison,
+            "num_compared_samples": limit
         }
 
     except S3Error as e:
-        logging.error(f"MinIO access error: {e}", exc_info=True)
-        raise HTTPException(status_code=502, detail="MinIO file retrieval error")
+        logging.error(f"\u274c MinIO access error: {e.code} - {e.message}", exc_info=True)
+        raise HTTPException(status_code=502, detail=f"MinIO access error: {e.message}")
+
     except Exception as e:
-        logging.error(f"Error in /evaluate-texts/: {e}", exc_info=True)
+        logging.error(f"\u274c Unexpected error in /evaluate-texts/: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
-    
-# ----------------------------------------------------------
+
+app.include_router(auth_router)
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok", "message": "This is the running backend."}
+
+@app.get("/routes")
+def list_routes():
+    return [route.path for route in app.routes]
+
 @app.get("/list-objects/")
 async def list_minio_objects(prefix: str = "uploads/"):
     try:
@@ -366,20 +463,24 @@ async def list_minio_objects(prefix: str = "uploads/"):
         logging.error(f"Failed to list MinIO objects: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to list MinIO files")
 
-
-
 @app.get("/user-files/")
 async def get_files(
     file_type: str = None,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)  # ✅
+    current_user: User = Depends(get_current_user)
 ):
     query = select(UploadedFile).where(UploadedFile.owner_id == current_user.id)
-    if file_type:
-        query = query.where(UploadedFile.file_type == file_type)
+    if file_type == "original":
+        query = query.where(UploadedFile.s3_path.contains("uploads/original/"))
+    elif file_type == "synthetic":
+        query = query.where(UploadedFile.s3_path.contains("uploads/synthetic/"))
     result = await db.execute(query)
     files = result.scalars().all()
-    return [f"{f.s3_path}" for f in files]
+    return [{"filename": f.filename, "s3_path": f.s3_path} for f in files]
+
+
+
+# End of file    return [route.path for route in app.routes]def list_routes():
 
 
 # End of file

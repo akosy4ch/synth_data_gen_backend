@@ -20,66 +20,105 @@ def load_dataset(
     Возвращает:
         (DataFrame, str): Загруженный DataFrame и тип задачи ('text', 'numeric', 'mixed').
     """
+    # --- Определение расширения ---
     ext = ""
     if hasattr(filepath, "read"):
-        # Попробуем определить расширение, если есть .name
         ext = os.path.splitext(getattr(filepath, "name", ""))[1].lower()
         if not ext:
-            ext = ".csv"  # По умолчанию
+            ext = ".csv"  # по умолчанию, если нет имени
     else:
         ext = os.path.splitext(filepath)[1].lower()
 
-    # --- Чтение файла по типу ---
-    if ext in [".csv", ".txt"]:
+    if hasattr(filepath, "read"):
+        size = len(filepath.read())
+        filepath.seek(0)
+        print("File size:", size)  # Debug
+
+    # --- Проверка бинарности ---
+    if hasattr(filepath, "read"):
+        peek = filepath.read(2048)
+        filepath.seek(0)
+        if b'\x00' in peek:
+            raise ValueError("Binary file detected. Please upload a valid text-based dataset.")
+        
+    if hasattr(filepath, "read"):
+        filepath.seek(0)  # <<< важно
         for enc in ["utf-8-sig", "cp1252", "cp1251"]:
             try:
                 df = pd.read_csv(filepath, encoding=enc, delimiter=delimiter, on_bad_lines="skip")
                 break
             except UnicodeDecodeError:
+                filepath.seek(0)  # обязательно сброс перед новой попыткой
+
+    # --- Чтение по расширению ---
+    if ext in [".csv", ".txt"]:
+        df = None
+        for enc in ["utf-8-sig", "cp1252", "cp1251"]:
+            try:
+                if hasattr(filepath, "seek"):
+                    filepath.seek(0)
+                df = pd.read_csv(filepath, encoding=enc, delimiter=delimiter, on_bad_lines="skip")
+                break
+            except (UnicodeDecodeError, pd.errors.ParserError, pd.errors.EmptyDataError):
+                if hasattr(filepath, "seek"):
+                    filepath.seek(0)
                 continue
+        if df is None:
+            raise ValueError("Failed to decode CSV/TXT file. Try saving it in UTF-8.")
+       
     elif ext in [".xlsx", ".xls"]:
-        engine = "openpyxl" if ext == ".xlsx" else "xlrd"
-        df = pd.read_excel(filepath, engine=engine)
+        try:
+            engine = "openpyxl" if ext == ".xlsx" else "xlrd"
+            df = pd.read_excel(filepath, engine=engine)
+        except Exception as e:
+            raise ValueError(f"Failed to read Excel file: {e}")
     elif ext == ".json":
         try:
             df = pd.read_json(filepath, encoding="utf-8-sig", lines=True)
         except ValueError:
-            df = pd.read_json(filepath, encoding="utf-8-sig")
+            try:
+                df = pd.read_json(filepath, encoding="utf-8-sig")
+            except Exception as e:
+                raise ValueError(f"Failed to read JSON file: {e}")
     else:
         raise ValueError(f"Unsupported file extension '{ext}'")
 
     if df.empty:
         raise ValueError("Loaded dataset is empty.")
 
-    # --- Чистим названия колонок ---
+    # --- Очистка названий колонок ---
     df.columns = df.columns.str.strip()
 
-    # --- Определяем тип задачи ---
+    # --- Определение типа задачи ---
     if target_column:
         if target_column not in df.columns:
             raise ValueError(f"Column '{target_column}' not found in dataset.")
-        dtype = df[target_column].dtype
-        task = _detect_task_type(dtype)
+        task = _detect_task_type(df[target_column].dtype)
     else:
-        numeric_count = df.select_dtypes(include=["number"]).shape[1]
-        object_count = df.select_dtypes(include=["object"]).shape[1]
-        total_count = df.shape[1]
-
-        if numeric_count == total_count:
-            task = "numeric"
-        elif object_count == total_count:
-            task = "text"
-        else:
-            task = "mixed"
+        task = _infer_task_type(df)
 
     return df, task
 
 
 def _detect_task_type(dtype) -> str:
-    """Вспомогательная функция для определения типа задачи по dtype"""
+    """Определение типа задачи по типу данных"""
     if pd.api.types.is_numeric_dtype(dtype):
         return "numeric"
     elif pd.api.types.is_string_dtype(dtype):
+        return "text"
+    else:
+        return "mixed"
+
+
+def _infer_task_type(df: pd.DataFrame) -> str:
+    """Определение типа задачи по структуре всего датафрейма"""
+    numeric_count = df.select_dtypes(include=["number"]).shape[1]
+    text_count = df.select_dtypes(include=["object"]).shape[1]
+    total = df.shape[1]
+
+    if numeric_count == total:
+        return "numeric"
+    elif text_count == total:
         return "text"
     else:
         return "mixed"
