@@ -39,7 +39,22 @@ from src.storage.minio_utils import upload_fileobj
 from src.database.utils import save_file_record_to_db
 
 # ----------------------------------------------------------
+log_dir = Path("logs")
+log_dir.mkdir(exist_ok=True)
+# Configure logging: INFO level by default, with timestamps and level name
+logging.basicConfig(
+    filename=log_dir / "app.log",
+    filemode="a",
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    level=logging.INFO
+)
+logger = logging.getLogger("synthetic")
+
 app = FastAPI()
+
+# Set up a FIFO queue for generation tasks and a background worker
+app.generation_queue = asyncio.Queue()
 
 # ----------------------------------------------------------
 @app.on_event("startup")
@@ -48,6 +63,9 @@ async def on_startup():
     logging.info("Database tables ensured")
     await asyncio.to_thread(init_minio_bucket)
     logging.info("MinIO bucket ensured")
+    asyncio.create_task(generation_worker())
+    logger.info("Synthetic data generation worker started.")
+
 def init_minio_bucket():
     client = get_minio_client()
     bucket = os.getenv("S3_BUCKET")
@@ -64,16 +82,16 @@ def init_minio_bucket():
             logging.error(f"Error initializing bucket {bucket}: {err}")
             raise
 
-# ----------------------------------------------------------
-# logging
-log_dir = Path("logs")
-log_dir.mkdir(exist_ok=True)
-logging.basicConfig(
-    filename=log_dir / "app.log",
-    filemode="a",
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
+async def generation_worker():
+    """Background task that processes the generation queue continuously."""
+    while True:
+        task = await app.generation_queue.get()
+        try:
+            await task()
+        except Exception as e:
+            logger.error("Unhandled exception in generation worker: %s", e, exc_info=True)
+        finally:
+            app.generation_queue.task_done()
 
 # ----------------------------------------------------------
 # CORS
@@ -98,10 +116,14 @@ def read_upload(file: UploadFile) -> bytes:
 
 
 @app.post("/analyze-columns/")
-async def analyze_columns(file: UploadFile = File(...),
-current_user: User = Depends(get_current_user)):
+async def analyze_columns(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user)
+):
     contents = await file.read()
-    object_name = f"uploads/original/{uuid.uuid4()}.csv"
+    # Preserve original extension
+    orig_ext = os.path.splitext(file.filename)[1].lower() or ".csv"
+    object_name = f"uploads/original/{uuid.uuid4()}{orig_ext}"
 
 
     try:
@@ -118,8 +140,9 @@ current_user: User = Depends(get_current_user)):
         raise HTTPException(status_code=502, detail="Storage error")
 
     try:
-        df = pd.read_csv(io.BytesIO(contents), encoding_errors="ignore", on_bad_lines="skip")
-        df.columns = df.columns.str.strip()  # удаление пробелов в названиях колонок
+        # Use load_dataset for robust file reading
+        df, _ = load_dataset(io.BytesIO(contents))
+        df.columns = df.columns.str.strip()
 
         column_info = []
         for col in df.columns:
@@ -153,137 +176,93 @@ async def create_synthetic_data(
     preserve_other_columns: bool = Form(True),
     current_user: User = Depends(get_current_user)
 ):
-    logging.info(f"starte !!!!")
-    print("stated")
-    import html
-    from pathlib import Path
-    import uuid
-    import io
-    import os
-
+    logger.info("Received request: columns=%s, models=%s, samples=%d, preserve_other_columns=%s",
+                columns, models, samples, preserve_other_columns)
     contents = await file.read()
-
-    # 🔄 Step 1: Derive synthetic filename
+    orig_ext = os.path.splitext(file.filename)[1].lower() or ".csv"
     orig_filename = Path(file.filename).stem
-    synthetic_filename = f"{orig_filename}_synthetic.csv"
+    synthetic_filename = f"{orig_filename}_synthetic{orig_ext}"
     object_name = f"uploads/synthetic/{uuid.uuid4()}_{synthetic_filename}"
 
-
     try:
-        # 🔼 Step 2: Upload to MinIO
         key = await upload_fileobj(contents, object_name)
-
-        # 🧾 Step 3: Save record in DB
         await save_file_record_to_db(
             filename=synthetic_filename,
             s3_path=key,
             file_type="synthetic",
             owner_id=current_user.id
         )
-        logging.info(f"Uploaded {synthetic_filename} to {key}")
+        logger.info(f"Uploaded {synthetic_filename} to {key}")
     except Exception as err:
-        logging.error(f"Storage or DB error: {err}", exc_info=True)
+        logger.error(f"Storage or DB error: {err}", exc_info=True)
         raise HTTPException(status_code=502, detail="Storage error")
 
     try:
-        df_original, _ = load_dataset(io.BytesIO(contents))
+        df, _ = load_dataset(io.BytesIO(contents))
         columns = [html.unescape(c.strip()) for c in columns]
-        missing = [c for c in columns if c not in df_original.columns]
-        if missing:
-            raise HTTPException(status_code=400, detail=f"Columns not found: {missing}")
+        for col in columns:
+            if col not in df.columns:
+                logger.error("Requested column '%s' not found in input data.", col)
+                raise HTTPException(status_code=400, detail=f"Column '{col}' not found in input data.")
+    except Exception as e:
+        logger.error("Failed to read input file: %s", e, exc_info=True)
+        raise HTTPException(status_code=400, detail="Could not read input file. Please provide a valid file.")
 
-        df_result = pd.DataFrame()
-        analysis_results = {}
+    loop = asyncio.get_event_loop()
+    result_future = loop.create_future()
 
-        min_len = min(len(df_original[c].dropna()) for c in columns)
-        gen_size = min(samples, min_len)
-
-        queue = asyncio.Queue()
-        for col, model_type in zip(columns, models):
-            logging.info(f"Processing column: {col} - dtype: {df_original[col].dtype} - model: {model_type}")
-            task = 'text' if is_string_dtype(df_original[col]) else 'numeric'
-
-            await queue.put((df_original[[col]], model_type, gen_size, task, col))
-        
-        async def worker():
-            while not queue.empty():
+    async def generation_task():
+        try:
+            # Use your existing async generate_columns logic
+            synthetic_data = {}
+            for col, model_name in zip(columns, models):
+                logger.info(f"Generating synthetic data for column '{col}' using model {model_name}...")
                 try:
-                    df_col, mtype, gsize, task, col = await queue.get()
-                    print(f"📦 Column: {col}, Model: {mtype}, Sample Size: {gsize}")
-                    print(f"📝 First 3 prompts: {df_col[col].dropna().astype(str).tolist()[:3]}")
-                    gen_df = await generate_synthetic(df_col, mtype, gsize, task, col)
-
-                    if gen_df.empty or gen_df.shape[1] == 0:
-                        logging.error(f"❌ Model did not generate any data for column '{col}'. DataFrame shape: {gen_df.shape}")
-                        continue  # 💡 Skip this column instead of crashing everything
-                    
-                    if col not in gen_df.columns:
-                        logging.warning(f"⚠️ Column '{col}' not found in generated output. Trying to rename. Columns: {list(gen_df.columns)}")
-                        if gen_df.shape[1] == 1:
-                            gen_df.columns = [col]
-                            logging.info(f"Renamed single column to '{col}'")
-                        else:
-                            logging.error(f"❌ Failed to map generated column to '{col}' due to ambiguous structure.")
-                            continue  # 💡 Gracefully skip instead of raising error
-
-                    # 💡 Safely access the column only after it's confirmed
-                    if col in gen_df.columns:
-                        gen_df[col] = gen_df[col].fillna('').astype(str)
-                        gen_df = gen_df[gen_df[col].str.strip() != '']
-                        while len(gen_df) < gsize:
-                            gen_df = pd.concat([gen_df, gen_df]).head(gsize)
-
-                        df_result[col] = gen_df[col].reset_index(drop=True)
-
-                        # 📊 Analyze text columns
-                        if task == 'text':
-                            orig_texts = df_col[col].dropna().astype(str).tolist()
-                            synth_texts = gen_df[col].dropna().astype(str).tolist()
-                            analysis_results[col] = {
-                                'stats_original': analyze_text_statistics(orig_texts),
-                                'stats_synthetic': analyze_text_statistics(synth_texts),
-                                'comparison': compare_datasets(orig_texts, synth_texts)
-                            }
+                    gen_df = await generate_synthetic(df[[col]], model_name, samples, 'text' if is_string_dtype(df[col]) else 'numeric', col)
+                    synthetic_col = gen_df[col].tolist() if col in gen_df else []
                 except Exception as e:
-                    logging.exception(f"❌ Error in synthetic generation for column {col}")
-                finally:
-                    queue.task_done()
-
-        await asyncio.gather(*[worker() for _ in range(3)])
-
-        if df_result.empty:
-            return {
+                    logger.error("Generation failed for column '%s': %s", col, e)
+                    synthetic_col = []
+                if not synthetic_col or len(synthetic_col) < samples:
+                    logger.warning("Model %s generated %d values for column '%s' (expected %d).",
+                                   model_name, len(synthetic_col), col, samples)
+                synthetic_data[col] = synthetic_col
+            synthetic_df = pd.DataFrame(synthetic_data)
+            if preserve_other_columns:
+                output_df = df.copy()
+                for col in columns:
+                    if col in synthetic_df:
+                        output_df[col] = synthetic_df[col]
+            else:
+                output_df = synthetic_df
+            result_payload = {
+                "synthetic": output_df.to_dict(orient="records"),
+                "analysis": {},  # Could include statistical comparisons
+            }
+            logger.info("Synthetic data generation successful. Generated %d rows for columns %s.",
+                        len(output_df), columns)
+            result_future.set_result(result_payload)
+        except Exception as e:
+            logger.error("Generation task failed for columns %s: %s", columns, e, exc_info=True)
+            result_future.set_result({
                 "synthetic": [],
                 "analysis": {},
-                "warning": "No columns were generated. Please review model selections and column data."
-            }
-        
-        if df_result.empty:
-            logging.error("df_result is empty after generation.")
+                "warning": f"No columns were generated due to an error: {e}"
+            })
 
-        if preserve_other_columns:
-            for col in columns:
-                if col in df_result.columns:
-                    df_original[col] = df_result[col]
-                else:
-                    logging.warning(f"Column '{col}' was not generated and will not be replaced in the output.")
-            output_df = df_original
-        else:
-            output_df = df_result
-
-        failed_columns = [col for col in columns if col not in df_result.columns]
-        response = {
-            'synthetic': output_df.replace([float('inf'), float('-inf')], None).where(pd.notnull(output_df), None).to_dict(orient='records'),
-            'analysis': analysis_results
+    await app.generation_queue.put(generation_task)
+    try:
+        response_data = await asyncio.wait_for(result_future, timeout=60.0)
+    except asyncio.TimeoutError:
+        logger.error("Synthetic generation timed out after 60 seconds for columns %s.", columns)
+        response_data = {
+            "synthetic": [],
+            "analysis": {},
+            "warning": "Generation timed out. Please try again with smaller input or later."
         }
-        if failed_columns:
-            response['warning'] = f"Some columns were not generated: {failed_columns}"
-        return response
-        
-    except Exception as e:
-        logging.error(f"Error generating synthetic data: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+    return response_data
 
+# ---------------------------------------------------------- 
 @app.post("/detect-best-config/")
 async def detect_best_config(file: UploadFile = File(...)):
     contents = await file.read()

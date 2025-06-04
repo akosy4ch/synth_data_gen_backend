@@ -7,14 +7,17 @@ import threading, logging, asyncio
 _MODEL_CACHE = {}
 _MARKOV_MODEL = None
 
+torch.set_num_threads(torch.get_num_threads())
+
 def get_device():
-    """Return 'cuda', 'mps', or 'cpu' based on availability."""
-    if torch.cuda.is_available():
-        return "cuda"
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    """Return 'mps' (Apple Silicon), 'cuda', or 'cpu'."""
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return "mps"
+    elif torch.cuda.is_available():
+        return "cuda"
     else:
         return "cpu"
+
 
 def move_to_device(model):
     """Move model to the appropriate device."""
@@ -62,10 +65,10 @@ def _get_model_and_tokenizer(model_name: str):
         mid = "EleutherAI/gpt-j-6B"
         model = AutoModelForCausalLM.from_pretrained(mid)
         tokenizer = AutoTokenizer.from_pretrained(mid)
-    elif mn == "llama-2":
-        mid = "meta-llama/Llama-2-7b-hf"
+    elif mn == "llama-3.2":
+        mid = "meta-llama/Llama-3-2-1b"
         model = AutoModelForCausalLM.from_pretrained(mid, trust_remote_code=True)
-        tokenizer = AutoTokenizer.from_pretrained(mid)
+        tokenizer = AutoTokenizer.from_pretrained(mid, trust_remote_code=True)
     elif mn == "deepseek":
         mid = "deepseek-ai/DeepSeek-V2"
         model = AutoModelForCausalLM.from_pretrained(mid, trust_remote_code=True)
@@ -82,6 +85,8 @@ def _get_model_and_tokenizer(model_name: str):
         raise ValueError(f"Unsupported model name: {model_name}")
     model = move_to_device(model)
     model.eval()
+    device = get_device()
+    logging.info(f"✅ Loading model '{model_name}' on device: {device}")
     _MODEL_CACHE[model_name] = (model, tokenizer)
     _warmup_model(model_name, model, tokenizer)
     return (model, tokenizer)
@@ -140,6 +145,7 @@ def _generate_with_masked_lm(model, tokenizer, prompt: str, max_tokens: int):
 
 def _generate_from_model(model_name: str, prompt: str, max_new_tokens: int = 50, num_return_sequences: int = 1):
     """Internal: generate text from prompt using specified model (handles all model types)."""
+
     mn = model_name.lower()
     if mn == "markov":
         if _MARKOV_MODEL is None:
@@ -151,31 +157,38 @@ def _generate_from_model(model_name: str, prompt: str, max_new_tokens: int = 50,
         if sentence is None:
             sentence = prompt or ""
         return [sentence]
+
     # Use transformers model for other types
     model, tokenizer = _get_model_and_tokenizer(model_name)
-    # Encode prompt
+
     inputs = tokenizer(prompt, return_tensors="pt")
     input_ids = inputs["input_ids"].to(get_device())
-    # If using masked LM, employ the special generation method
+
     if mn == "distil-cmlm":
         text = _generate_with_masked_lm(model, tokenizer, prompt, max_new_tokens)
         return [text]
-    # Set generation parameters
+
     gen_kwargs = {"max_new_tokens": max_new_tokens, "num_return_sequences": num_return_sequences}
     if num_return_sequences > 1:
         gen_kwargs.update({"do_sample": True, "temperature": 0.8})
+
     with torch.inference_mode():
         output_ids = model.generate(input_ids, **gen_kwargs)
-    # Decode outputs
+
     outputs = []
     for seq in output_ids:
         text = tokenizer.decode(seq, skip_special_tokens=True)
-        # Remove prompt from causal LM output
-        if mn in {"gpt-j", "llama-2", "deepseek", "openelm"}:
+        if mn in {"gpt-j", "llama-3.2", "deepseek", "openelm"}:
             prompt_len = input_ids.shape[1]
             continuation_ids = seq[prompt_len:]
             text = tokenizer.decode(continuation_ids, skip_special_tokens=True).strip()
+        logging.debug(f"🔹 Decoded output: {text!r}")
         outputs.append(text)
+
+    # ✅ Now check for empty outputs AFTER outputs is defined
+    if not outputs or all(not str(o).strip() for o in outputs):
+        logging.warning(f"🛑 Model {model_name} produced only empty outputs for prompt: {prompt[:50]!r}")
+
     return outputs
 
 def generate_text(prompt: str, model_name: str, num_samples: int = 1, max_new_tokens: int = 50, timeout: float = None):
@@ -192,11 +205,12 @@ def generate_text(prompt: str, model_name: str, num_samples: int = 1, max_new_to
             # _generate_from_model returns a list of outputs; take the first element
             generated_text = out_list[0] if isinstance(out_list, list) else out_list
             
-            if generated_text is None or not str(generated_text).strip():
-                logging.warning(f"⚠️ Skipped empty output for sample {i+1} (model={model_name})")
+            if generated_text is None:
+                logging.warning(f"⚠️ Got None output for sample {i+1} (model={model_name})")
                 continue
+            logging.debug(f"[{model_name}] Generated raw: {generated_text!r}")
+            results.append(generated_text.strip())  # keep empty strings for debugging
 
-            results.append(generated_text)
         except Exception as e:
             logging.error(f"Error in generation (model={model_name}): {e}")
             # Attempt fallback to Markov chain if available and if not already using it
@@ -215,11 +229,11 @@ def generate_text(prompt: str, model_name: str, num_samples: int = 1, max_new_to
         results.extend([""] * (num_samples - len(results)))
     return pd.DataFrame({"generated": results})
 
-async def generate_text_async(df: pd.DataFrame, model_name: str, num_samples: int, column: str, max_new_tokens: int = 50, timeout: float = None):
-    prompt_texts = df[column].dropna().astype(str).tolist()
+
+
+async def generate_text_async(df: pd.DataFrame, model_name: str, num_samples: int, column: str, max_new_tokens: int = 50, timeout: float = None) -> pd.DataFrame:
     loop = asyncio.get_running_loop()
-    print(f"🧪 Prompts received for column '{column}': {prompt_texts[:3]}")
-    print(f"🔢 Sample size (num_samples): {num_samples}")
+    prompt_texts = df[column].dropna().astype(str).tolist()
 
     def batch_generate():
         results = []
@@ -228,15 +242,20 @@ async def generate_text_async(df: pd.DataFrame, model_name: str, num_samples: in
                 out_df = generate_text(prompt, model_name, num_samples, max_new_tokens, timeout)
                 for text in out_df.get("generated", []):
                     if text is not None and str(text).strip():
-                        results.append(text)
+                        results.append(text.strip() if text is not None else "")
             except Exception as e:
-                print(f"❌ Error in generate_text | prompt: {prompt} | model: {model_name} | error: {e}")
-        print(f"✅ Generated {len(results)} non-empty outputs for '{column}' using model {model_name}")
+                logging.warning(f"Generation error for prompt: {prompt[:50]} | {e}")
+        
+        # Ensure minimum size
+        while len(results) < num_samples:
+            results += results  # Duplicate to pad
+        results = results[:num_samples]  # Trim
+
         return pd.DataFrame({column: results})
 
     result_df = await loop.run_in_executor(None, batch_generate)
 
-    if result_df.shape[1] == 1 and result_df.columns[0] != column:
+    if column not in result_df.columns:
         result_df.columns = [column]
 
     return result_df

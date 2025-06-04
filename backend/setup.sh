@@ -19,8 +19,7 @@ echo "📚 Installing requirements..."
 pip install -r requirements.txt
 
 # Устанавливаем Parrot отдельно
-echo "🦜 Installing Parrot paraphraser..."
-pip install git+https://github.com/PrithivirajDamodaran/Parrot_Paraphraser.git
+
 
 # Создаем папку uploads (если нет)
 mkdir -p uploads

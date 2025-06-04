@@ -21,6 +21,8 @@ minio>=7.1.0  # S3 client for MinIO
 # SDV для числовых данных
 sdv
 
+greenlet>=3.0.0
+
 # Markov цепи для текста
 markovify
 
