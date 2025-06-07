@@ -7,6 +7,7 @@ import logging
 import asyncio
 from pathlib import Path
 from typing import List
+import logging
 
 import pandas as pd
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
@@ -18,11 +19,14 @@ from minio import Minio
 from minio.error import S3Error
 
 from src.auth.dependencies import get_current_user
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 from src.auth.database_models import User
 
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from src.generator import generate_synthetic
+from src.generator.generator import generate_synthetic
 
 from src.data_processing.data_processing import load_dataset
 from src.text_analysis.text_analysis import analyze_text_statistics, compare_datasets
@@ -178,11 +182,15 @@ async def create_synthetic_data(
 ):
     logger.info("Received request: columns=%s, models=%s, samples=%d, preserve_other_columns=%s",
                 columns, models, samples, preserve_other_columns)
+
     contents = await file.read()
     orig_ext = os.path.splitext(file.filename)[1].lower() or ".csv"
     orig_filename = Path(file.filename).stem
     synthetic_filename = f"{orig_filename}_synthetic{orig_ext}"
     object_name = f"uploads/synthetic/{uuid.uuid4()}_{synthetic_filename}"
+
+    loop = asyncio.get_event_loop()
+    result_future = loop.create_future()
 
     try:
         key = await upload_fileobj(contents, object_name)
@@ -208,49 +216,73 @@ async def create_synthetic_data(
         logger.error("Failed to read input file: %s", e, exc_info=True)
         raise HTTPException(status_code=400, detail="Could not read input file. Please provide a valid file.")
 
-    loop = asyncio.get_event_loop()
-    result_future = loop.create_future()
-
+    # 🧠 Вложенная задача (замыкание)
     async def generation_task():
         try:
-            # Use your existing async generate_columns logic
             synthetic_data = {}
+            skipped_columns = []
+
             for col, model_name in zip(columns, models):
                 logger.info(f"Generating synthetic data for column '{col}' using model {model_name}...")
                 try:
-                    gen_df = await generate_synthetic(df[[col]], model_name, samples, 'text' if is_string_dtype(df[col]) else 'numeric', col)
+                    gen_df = await generate_synthetic(
+                        df[[col]], model_name, samples,
+                        'text' if is_string_dtype(df[col]) else 'numeric', col
+                    )
                     synthetic_col = gen_df[col].tolist() if col in gen_df else []
                 except Exception as e:
                     logger.error("Generation failed for column '%s': %s", col, e)
                     synthetic_col = []
+
                 if not synthetic_col or len(synthetic_col) < samples:
                     logger.warning("Model %s generated %d values for column '%s' (expected %d).",
-                                   model_name, len(synthetic_col), col, samples)
-                synthetic_data[col] = synthetic_col
+                                model_name, len(synthetic_col), col, samples)
+                    if synthetic_col:
+                        while len(synthetic_col) < samples:
+                            synthetic_col += synthetic_col
+                    synthetic_col = synthetic_col[:samples] or [""] * samples
+
+                if len(synthetic_col) == samples:
+                    synthetic_data[col] = synthetic_col
+                else:
+                    skipped_columns.append(col)
+                    logger.warning(f"⚠️ Skipping column {col} due to length mismatch.")
+
+            if not synthetic_data:
+                raise ValueError("No columns were successfully generated.")
+
             synthetic_df = pd.DataFrame(synthetic_data)
+
             if preserve_other_columns:
                 output_df = df.copy()
-                for col in columns:
-                    if col in synthetic_df:
-                        output_df[col] = synthetic_df[col]
+                for col in synthetic_df.columns:
+                    output_df[col] = synthetic_df[col]
             else:
                 output_df = synthetic_df
+
             result_payload = {
                 "synthetic": output_df.to_dict(orient="records"),
-                "analysis": {},  # Could include statistical comparisons
+                "analysis": {},
             }
-            logger.info("Synthetic data generation successful. Generated %d rows for columns %s.",
-                        len(output_df), columns)
+
+            if skipped_columns:
+                result_payload["warning"] = f"Some columns were skipped: {skipped_columns}"
+
+            logger.info("✅ Synthetic data generation successful. Generated %d rows for columns %s.",
+                        len(output_df), list(synthetic_data.keys()))
             result_future.set_result(result_payload)
+
         except Exception as e:
-            logger.error("Generation task failed for columns %s: %s", columns, e, exc_info=True)
+            logger.error("❌ Generation task failed for columns %s: %s", columns, e, exc_info=True)
             result_future.set_result({
                 "synthetic": [],
                 "analysis": {},
                 "warning": f"No columns were generated due to an error: {e}"
             })
 
+    # ✅ Важно: ДОБАВИТЬ В ОЧЕРЕДЬ
     await app.generation_queue.put(generation_task)
+
     try:
         response_data = await asyncio.wait_for(result_future, timeout=60.0)
     except asyncio.TimeoutError:
@@ -260,6 +292,7 @@ async def create_synthetic_data(
             "analysis": {},
             "warning": "Generation timed out. Please try again with smaller input or later."
         }
+
     return response_data
 
 # ---------------------------------------------------------- 
@@ -459,7 +492,4 @@ async def get_files(
 
 
 
-# End of file    return [route.path for route in app.routes]def list_routes():
-
-
-# End of file
+# End of file    
